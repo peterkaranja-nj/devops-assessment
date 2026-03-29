@@ -1,0 +1,223 @@
+---
+# configure-gateway.yml — Ansible playbook that runs AFTER Terraform provisioning.
+#
+# What it does on the gateway VM:
+#   1. Sets the system hostname
+#   2. Installs and starts nginx
+#   3. Writes a custom nginx default page (useful for health check verification)
+#   4. Creates a deploy user with SSH key access (principle of least privilege)
+#   5. Configures UFW firewall (belt-and-suspenders alongside the Azure NSG)
+#   6. Hardens SSH daemon config
+#
+# Run with:
+#   ansible-playbook -i inventory.ini configure-gateway.yml
+#
+# Dry-run (check mode):
+#   ansible-playbook -i inventory.ini configure-gateway.yml --check
+
+- name: Configure gateway VM
+  hosts: gateway
+  become: true
+  vars:
+    hostname: vm-gateway
+    deploy_user: deploy
+    # Path to the deploy user's public key.
+    # In production: pull from Azure Key Vault or HashiCorp Vault.
+    deploy_user_pub_key: "{{ lookup('file', '~/.ssh/id_rsa.pub') }}"
+    nginx_port: 80
+
+  tasks:
+
+    # ── System baseline ──────────────────────────────────────────
+
+    - name: Set system hostname
+      hostname:
+        name: "{{ hostname }}"
+
+    - name: Update /etc/hosts with new hostname
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: "127.0.1.1 {{ hostname }}"
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - nginx
+          - ufw
+          - curl
+          - htop
+          - unattended-upgrades
+        state: present
+
+    # ── nginx ────────────────────────────────────────────────────
+
+    - name: Deploy custom nginx default page
+      copy:
+        dest: /var/www/html/index.html
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head><title>SRE Assessment — Gateway VM</title></head>
+          <body>
+            <h1>Gateway VM is healthy</h1>
+            <p>Hostname: {{ hostname }}</p>
+            <p>Managed by Ansible + Terraform</p>
+          </body>
+          </html>
+        owner: www-data
+        group: www-data
+        mode: "0644"
+
+    - name: Ensure nginx is started and enabled
+      service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Verify nginx is responding on port 80
+      uri:
+        url: "http://localhost:80"
+        return_content: false
+        status_code: 200
+      register: nginx_check
+
+    - name: Report nginx status
+      debug:
+        msg: "nginx is responding correctly (HTTP 200)"
+      when: nginx_check.status == 200
+
+    # ── Deploy user ──────────────────────────────────────────────
+
+    - name: Create deploy user (non-root, for application deployments)
+      user:
+        name: "{{ deploy_user }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Add deploy user to sudo group (passwordless sudo for deployment scripts)
+      user:
+        name: "{{ deploy_user }}"
+        groups: sudo
+        append: true
+
+    - name: Configure passwordless sudo for deploy user
+      copy:
+        dest: "/etc/sudoers.d/{{ deploy_user }}"
+        content: "{{ deploy_user }} ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl reload nginx\n"
+        validate: "visudo -cf %s"
+        mode: "0440"
+
+    - name: Set up SSH key for deploy user
+      authorized_key:
+        user: "{{ deploy_user }}"
+        state: present
+        key: "{{ deploy_user_pub_key }}"
+
+    # ── SSH hardening ────────────────────────────────────────────
+
+    - name: Harden SSH configuration
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+        validate: "sshd -t -f %s"
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+        - { regexp: '^#?LoginGraceTime', line: 'LoginGraceTime 20' }
+      notify: Restart sshd
+
+    # ── UFW firewall (belt-and-suspenders alongside Azure NSG) ───
+
+    - name: Allow SSH through UFW
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Allow HTTP through UFW
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Allow HTTPS through UFW
+      ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+
+    - name: Enable UFW with default deny
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    # ── Unattended upgrades (security patches) ───────────────────
+
+    - name: Configure unattended-upgrades for security patches
+      copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        content: |
+          Unattended-Upgrade::Allowed-Origins {
+              "${distro_id}:${distro_codename}-security";
+          };
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Mail "root";
+        mode: "0644"
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: sshd
+        state: restarted
+
+---
+# verify.yml — Lightweight verification playbook.
+# Run after configure-gateway.yml to confirm the desired state.
+
+- name: Verify gateway VM configuration
+  hosts: gateway
+  become: true
+
+  tasks:
+
+    - name: Check nginx is running
+      service_facts:
+
+    - name: Assert nginx is active
+      assert:
+        that:
+          - "'nginx' in services"
+          - "services['nginx'].state == 'running'"
+        fail_msg: "nginx is NOT running — check 'systemctl status nginx'"
+        success_msg: "nginx is running correctly"
+
+    - name: Check deploy user exists
+      getent:
+        database: passwd
+        key: deploy
+
+    - name: Assert SSH root login is disabled
+      command: grep -E "^PermitRootLogin no" /etc/ssh/sshd_config
+      changed_when: false
+
+    - name: Print summary
+      debug:
+        msg:
+          - "hostname: {{ ansible_hostname }}"
+          - "nginx: running"
+          - "deploy user: present"
+          - "SSH hardening: applied"

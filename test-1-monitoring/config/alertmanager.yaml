@@ -1,0 +1,155 @@
+---
+# Alertmanager — routes Prometheus alerts to notification channels.
+# Deployed alongside Prometheus in the monitoring namespace.
+#
+# Routing strategy:
+#   critical → PagerDuty (immediate page, 24/7)
+#   warning  → Slack #alerts channel (business hours triage)
+#   All routes have a 4h repeat_interval to avoid alert fatigue.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+  labels:
+    app: alertmanager
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      # Default: resolve an alert after 5 minutes of no data
+      resolve_timeout: 5m
+      # Slack webhook — set via CI/CD secret, not hardcoded here
+      slack_api_url: "REPLACE_WITH_SLACK_WEBHOOK_URL"
+
+    # Inhibit warning alerts when a critical alert is already firing
+    # for the same pod/node — reduces noise during cascading failures.
+    inhibit_rules:
+      - source_matchers:
+          - severity = critical
+        target_matchers:
+          - severity = warning
+        equal: [namespace, pod]
+
+    route:
+      receiver: slack-warnings
+      group_by: [alertname, namespace, severity]
+      group_wait: 30s        # Wait before sending first notification
+      group_interval: 5m     # Wait before sending updates
+      repeat_interval: 4h    # Resend if still firing after 4h
+
+      routes:
+        # Critical alerts go to Slack #critical channel immediately
+        - matchers:
+            - severity = critical
+          receiver: slack-critical
+          group_wait: 10s
+          repeat_interval: 1h
+
+        # Pod-level warnings
+        - matchers:
+            - alertname =~ "PodCrashLoopBackOff|PodOOMKilled|PodNotReady"
+          receiver: slack-warnings
+          repeat_interval: 2h
+
+        # Node-level warnings
+        - matchers:
+            - alertname =~ "NodeHighCPU|NodeHighMemory|NodeDiskPressure"
+          receiver: slack-warnings
+          repeat_interval: 4h
+
+    receivers:
+      - name: slack-critical
+        slack_configs:
+          - channel: "#alerts-critical"
+            username: "Prometheus"
+            icon_emoji: ":fire:"
+            color: "danger"
+            title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              *Severity:* {{ .Labels.severity }}
+              *Namespace:* {{ .Labels.namespace }}
+              {{ if .Annotations.runbook_url }}*Runbook:* <{{ .Annotations.runbook_url }}|Click here>{{ end }}
+              {{ end }}
+            send_resolved: true
+
+      - name: slack-warnings
+        slack_configs:
+          - channel: "#alerts-warnings"
+            username: "Prometheus"
+            icon_emoji: ":warning:"
+            color: "warning"
+            title: '[{{ .Status | toUpper }}] {{ .CommonAnnotations.summary }}'
+            text: |
+              {{ range .Alerts }}
+              *Alert:* {{ .Annotations.summary }}
+              *Description:* {{ .Annotations.description }}
+              {{ end }}
+            send_resolved: true
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels:
+    app: alertmanager
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yaml
+            - --storage.path=/alertmanager
+            - --web.listen-address=:9093
+          ports:
+            - name: http
+              containerPort: 9093
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: storage
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          secret:
+            secretName: alertmanager-config
+        - name: storage
+          emptyDir: {}

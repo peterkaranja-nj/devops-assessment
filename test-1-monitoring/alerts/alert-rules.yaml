@@ -1,0 +1,181 @@
+---
+# Prometheus Alert Rules
+# ConfigMap loaded by the Prometheus Deployment at /etc/prometheus/alerts/
+# Rules are evaluated every 30s (matching global.evaluation_interval).
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-alerts
+  namespace: monitoring
+  labels:
+    app: prometheus
+data:
+  alerts.yaml: |
+    groups:
+
+      # ─────────────────────────────────────────────────────────────
+      # GROUP 1: Pod Health
+      # ─────────────────────────────────────────────────────────────
+      - name: pod_health
+        rules:
+
+          # ALERT 1 (Required): Pod in CrashLoopBackOff > 5 minutes
+          # Rationale: CrashLoopBackOff means the container keeps
+          # dying and Kubernetes keeps restarting it. After 5m the
+          # issue is unlikely to self-heal — an engineer needs to look.
+          - alert: PodCrashLoopBackOff
+            expr: |
+              kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"} == 1
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is in CrashLoopBackOff"
+              description: >
+                Container {{ $labels.container }} in pod {{ $labels.pod }}
+                (namespace {{ $labels.namespace }}) has been in CrashLoopBackOff
+                for more than 5 minutes. Check logs with:
+                kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+              runbook_url: "https://runbooks.example.com/crashloopbackoff"
+
+          # Pod OOMKilled — container is being killed by the kernel
+          # due to exceeding its memory limit. Usually means limits
+          # are too tight or there's a memory leak.
+          - alert: PodOOMKilled
+            expr: |
+              kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+            for: 0m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} was OOMKilled"
+              description: >
+                Container {{ $labels.container }} was killed due to out-of-memory.
+                Consider increasing memory limits or investigating memory usage.
+
+          # Pod not ready for more than 10 minutes (not just starting)
+          - alert: PodNotReady
+            expr: |
+              min_over_time(
+                kube_pod_status_ready{condition="true"}[10m]
+              ) == 0
+              and
+              kube_pod_status_phase{phase=~"Running|Pending"} == 1
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not ready"
+              description: >
+                Pod {{ $labels.pod }} in namespace {{ $labels.namespace }}
+                has not been Ready for 10 minutes.
+
+      # ─────────────────────────────────────────────────────────────
+      # GROUP 2: Node Resources
+      # ─────────────────────────────────────────────────────────────
+      - name: node_resources
+        rules:
+
+          # ALERT 2 (Required): Node CPU > 80% for 3 minutes
+          # Rationale: Sustained high CPU causes throttling and
+          # latency spikes. 3m avoids noise from short bursts.
+          - alert: NodeHighCPU
+            expr: |
+              100 - (
+                avg by(instance) (
+                  rate(node_cpu_seconds_total{mode="idle"}[2m])
+                ) * 100
+              ) > 80
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} CPU > 80%"
+              description: >
+                Node {{ $labels.instance }} has been above 80% CPU utilisation
+                for more than 3 minutes (current: {{ $value | printf "%.1f" }}%).
+                Check for runaway processes or consider scaling the node pool.
+              runbook_url: "https://runbooks.example.com/high-cpu"
+
+          # Node memory pressure
+          - alert: NodeHighMemory
+            expr: |
+              (
+                node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
+              ) / node_memory_MemTotal_bytes * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} memory > 85%"
+              description: >
+                Node {{ $labels.instance }} is using more than 85% of memory
+                (current: {{ $value | printf "%.1f" }}%). Risk of OOM evictions.
+
+          # Node disk pressure — AKS nodes have limited ephemeral storage
+          - alert: NodeDiskPressure
+            expr: |
+              (
+                node_filesystem_size_bytes{mountpoint="/"} -
+                node_filesystem_free_bytes{mountpoint="/"}
+              ) / node_filesystem_size_bytes{mountpoint="/"} * 100 > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Node {{ $labels.instance }} disk usage > 80%"
+              description: >
+                Root filesystem on {{ $labels.instance }} is {{ $value | printf "%.1f" }}% full.
+                High disk usage can cause pod evictions and node NotReady conditions.
+
+      # ─────────────────────────────────────────────────────────────
+      # GROUP 3: Deployment Health (ALERT 3 — My Choice)
+      # ─────────────────────────────────────────────────────────────
+      - name: deployment_health
+        rules:
+
+          # ALERT 3 (My choice): Deployment unavailable replicas
+          #
+          # WHY I chose this:
+          # CrashLoopBackOff catches a single failing pod, but the most
+          # dangerous production scenario is a Deployment where the
+          # *desired* replica count cannot be satisfied — e.g. after a
+          # bad rollout leaves 0 of 3 pods healthy, or a cluster
+          # autoscaler failure means pods stay Pending indefinitely.
+          # This alert fires when any Deployment has fewer Ready pods
+          # than it asked for, sustained for 5 minutes. It catches:
+          #   - failed rollouts (new RS pods crash, old RS already gone)
+          #   - insufficient node capacity (pods stuck Pending)
+          #   - misconfigured PodDisruptionBudgets blocking drains
+          - alert: DeploymentReplicasMismatch
+            expr: |
+              (
+                kube_deployment_spec_replicas
+                - kube_deployment_status_replicas_available
+              ) > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has unavailable replicas"
+              description: >
+                Deployment {{ $labels.deployment }} in namespace {{ $labels.namespace }}
+                has {{ $value }} unavailable replica(s) for more than 5 minutes.
+                Run: kubectl rollout status deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}
+              runbook_url: "https://runbooks.example.com/deployment-replicas"
+
+          # HPA at maximum — autoscaler cannot scale further
+          - alert: HPAAtMaxReplicas
+            expr: |
+              kube_horizontalpodautoscaler_status_current_replicas
+              ==
+              kube_horizontalpodautoscaler_spec_max_replicas
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HPA {{ $labels.namespace }}/{{ $labels.horizontalpodautoscaler }} at max replicas"
+              description: >
+                HPA {{ $labels.horizontalpodautoscaler }} has been at its maximum replica
+                count for 15 minutes. The cluster may be under-provisioned for current load.
