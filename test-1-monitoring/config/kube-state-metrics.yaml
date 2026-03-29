@@ -1,9 +1,4 @@
----
-# kube-state-metrics — exposes Kubernetes object state as Prometheus metrics.
-# Required for: kube_pod_status_phase, kube_deployment_spec_replicas,
-# kube_pod_container_status_waiting_reason (CrashLoopBackOff alert), etc.
-#
-# We deploy the official release manifest with resource limits added.
+
 
 apiVersion: v1
 kind: ServiceAccount
