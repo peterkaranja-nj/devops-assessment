@@ -1,7 +1,4 @@
----
-# Prometheus — ConfigMap containing prometheus.yml and alerting rules.
-# kube-state-metrics and node-exporter are deployed separately
-# (see kube-state-metrics.yaml and node-exporter.yaml).
+
 
 apiVersion: v1
 kind: ConfigMap
