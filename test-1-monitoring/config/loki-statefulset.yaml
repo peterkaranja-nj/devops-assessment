@@ -1,8 +1,3 @@
----
-# Loki — single-binary mode for a lean intern-assessment setup.
-# In production on AKS you would run Loki in microservices mode
-# backed by Azure Blob Storage (object_store: azure) for durability.
-# That is documented in the README under "Production Improvements".
 
 apiVersion: v1
 kind: Namespace
