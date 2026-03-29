@@ -1,11 +1,4 @@
----
-# Alertmanager — routes Prometheus alerts to notification channels.
-# Deployed alongside Prometheus in the monitoring namespace.
-#
-# Routing strategy:
-#   critical → PagerDuty (immediate page, 24/7)
-#   warning  → Slack #alerts channel (business hours triage)
-#   All routes have a 4h repeat_interval to avoid alert fatigue.
+
 
 apiVersion: v1
 kind: Secret
